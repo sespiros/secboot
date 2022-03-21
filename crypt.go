@@ -33,6 +33,7 @@ import (
 
 	"github.com/snapcore/secboot/internal/keyring"
 	"github.com/snapcore/secboot/internal/luks2"
+	"github.com/snapcore/secboot/internal/luksview"
 )
 
 var (
@@ -45,8 +46,17 @@ var (
 	luks2AddKey          = luks2.AddKey
 	luks2Deactivate      = luks2.Deactivate
 	luks2Format          = luks2.Format
+	luks2ImportToken     = luks2.ImportToken
 	luks2KillSlot        = luks2.KillSlot
+	luks2RemoveToken     = luks2.RemoveToken
 	luks2SetSlotPriority = luks2.SetSlotPriority
+
+	newLUKSView = luksview.NewView
+)
+
+const (
+	defaultKeyslotName         = "default"
+	defaultRecoveryKeyslotName = "default-recovery"
 )
 
 // RecoveryKey corresponds to a 16-byte recovery key in its binary form.
@@ -516,21 +526,31 @@ func DeactivateVolume(volumeName string) error {
 // InitializeLUKS2ContainerOptions carries options for initializing LUKS2
 // containers.
 type InitializeLUKS2ContainerOptions struct {
-	// MetadataKiBSize sets the size of the LUKS2 metadata (JSON) area,
-	// expressed in multiples of 1024 bytes. The value includes 4096 bytes
-	// for the binary metadata. According to LUKS2 specification and
-	// cryptsetup(8), only these values are valid: 16, 32, 64, 128, 256,
-	// 512, 1024, 2048 and 4096 KiB.
+	// MetadataKiBSize sets the size of the metadata area in KiB. This
+	//
+	// MetadataKiBSize sets the size of the metadata area in KiB. 4KiB of
+	// this is used for the fixed-size binary header, with the remaining
+	// space being used for the JSON area. Setting this to zero causes
+	// the container to be initialized with the default metadata area size.
+	// If set to a non zero value, it must be a power of 2 between 16KiB
+	// and 4MiB.
 	MetadataKiBSize int
-	// KeyslotsAreaSize sets the size of the LUKS2 binary keyslot area,
-	// expressed in multiples of 1024 bytes. The value must be aligned to
-	// 4096 bytes, with the maximum size of 128MB.
+
+	// KeyslotsAreaKiBSize sets the size of the binary keyslot area in KiB.
+	// Setting this to zero causes the container to be initialized with
+	// the default keyslots area size. If set to a non-zero value, the
+	// value must be a multiple of 4KiB up to a maximum of 128MiB.
 	KeyslotsAreaKiBSize int
 
 	// KDFOptions sets the KDF options for the initial keyslot. If this
 	// is nil then the default settings defined by this package are used
 	// (4 iterations and a memory cost of 32KiB).
 	KDFOptions *KDFOptions
+
+	// InitialKeyslotName sets the name that will be used to identify
+	// the initial keyslot. If this is empty, then the name will be
+	// set to "default".
+	InitialKeyslotName string
 }
 
 func (o *InitializeLUKS2ContainerOptions) formatOpts() *luks2.FormatOptions {
@@ -540,24 +560,32 @@ func (o *InitializeLUKS2ContainerOptions) formatOpts() *luks2.FormatOptions {
 		KDFOptions:          o.KDFOptions.luksOpts()}
 }
 
-// InitializeLUKS2Container will initialize the partition at the specified devicePath as a new LUKS2 container. This can only
-// be called on a partition that isn't mapped. The label for the new LUKS2 container is provided via the label argument.
+// InitializeLUKS2Container will initialize the partition at the specified devicePath
+// as a new LUKS2 container. This can only be called on a partition that isn't mapped.
+// The label for the new LUKS2 container is provided via the label argument.
 //
-// The initial key used for unlocking the container is provided via the key argument, and must be a cryptographically secure
-// random number of at least 32-bytes. The key should be encrypted by using SealKeyToTPM.
+// The container will be configured to encrypt data with AES-256 and XTS block cipher
+// mode.
 //
-// The container will be configured to encrypt data with AES-256 and XTS block cipher mode.
+// The initial key used for unlocking the container is provided via the key argument,
+// and must be a cryptographically secure random number of at least 32-bytes.
+//
+// The initial keyslot will be created with the name specified in the
+// InitialKeyslotName field of options. If this is empty, "default" will be used.
+//
+// The initial key should be protected by some platform-specific mechanism in order
+// to create a KeyData object. XXX(chrisccoulson): Add documentation about how to
+// write KeyData to the new slot once a PR lands with that API.
 //
 // On failure, this will return an error containing the output of the cryptsetup command.
 //
-// WARNING: This function is destructive. Calling this on an existing LUKS container will make the data contained inside of it
-// irretrievable.
-func InitializeLUKS2Container(devicePath, label string, key []byte, options *InitializeLUKS2ContainerOptions) error {
+// WARNING: This function is destructive. Calling this on an existing LUKS container
+// will make the data contained inside of it irretrievable.
+func InitializeLUKS2Container(devicePath, label string, key DiskUnlockKey, options *InitializeLUKS2ContainerOptions) error {
 	if len(key) < 32 {
 		return fmt.Errorf("expected a key length of at least 256-bits (got %d)", len(key)*8)
 	}
 
-	// Simplify things a bit
 	// Use a reduced cost for the KDF. This is done because we have a high entropy key rather
 	// than a low entropy passphrase. Setting a higher cost provides no security benefit but
 	// does slow down unlocking. If an adversary is going to attempt to brute force this key,
@@ -565,15 +593,27 @@ func InitializeLUKS2Container(devicePath, label string, key []byte, options *Ini
 	// protection of this key, some of which can be verified without running a KDF. For
 	// example, with a TPM sealed object, you can verify the parent storage key's seed by
 	// computing the key object's HMAC key and verifying the integrity value on the outer wrapper.
-	defaultKdfOptions := &KDFOptions{MemoryKiB: 32, ForceIterations: 4}
 	if options == nil {
-		options = &InitializeLUKS2ContainerOptions{KDFOptions: defaultKdfOptions}
-	} else if options.KDFOptions == nil {
-		options.KDFOptions = defaultKdfOptions
+		var defaultOptions InitializeLUKS2ContainerOptions
+		options = &defaultOptions
+	}
+	if options.KDFOptions == nil {
+		options.KDFOptions = &KDFOptions{MemoryKiB: 32, ForceIterations: 4}
+	}
+	if options.InitialKeyslotName == "" {
+		options.InitialKeyslotName = defaultKeyslotName
 	}
 
 	if err := luks2Format(devicePath, label, key, options.formatOpts()); err != nil {
 		return xerrors.Errorf("cannot format: %w", err)
+	}
+
+	token := luksview.KeyDataToken{
+		TokenBase: luksview.TokenBase{
+			TokenKeyslot: 0,
+			TokenName:    options.InitialKeyslotName}}
+	if err := luks2ImportToken(devicePath, &token, nil); err != nil {
+		return xerrors.Errorf("cannot import token: %w", err)
 	}
 
 	if err := luks2SetSlotPriority(devicePath, 0, luks2.SlotPriorityHigh); err != nil {
@@ -583,40 +623,115 @@ func InitializeLUKS2Container(devicePath, label string, key []byte, options *Ini
 	return nil
 }
 
-// AddRecoveryKeyToLUKS2Container adds a fallback recovery key to an existing LUKS2 container created with InitializeLUKS2Container.
-// The recovery key is intended to be used as a fallback mechanism that operates independently of the TPM in order to unlock the
-// container in the event that the key encrypted with SealKeyToTPM cannot be used to unlock it. The devicePath argument specifies
-// the device node for the partition that contains the LUKS2 container. The existing key for the container is provided via the
-// key argument.
-//
-// The recovery key is provided via the recoveryKey argument and must be a cryptographically secure 16-byte number.
-func AddRecoveryKeyToLUKS2Container(devicePath string, key []byte, recoveryKey RecoveryKey, options *KDFOptions) error {
-	if options == nil {
-		options = &KDFOptions{}
+func removeOrphanedTokens(devicePath string, view *luksview.View) {
+	for _, id := range view.OrphanedTokenIds() {
+		luks2RemoveToken(devicePath, id)
 	}
-	return luks2AddKey(devicePath, key, recoveryKey[:],
-		&luks2.AddKeyOptions{
-			KDFOptions: options.luksOpts(),
-			Slot:       luks2.AnySlot})
 }
 
-// ChangeLUKS2KeyUsingRecoveryKey changes the key normally used for unlocking the LUKS2 container at devicePath. This function
-// is intended to be used after the container is unlocked with the recovery key, in the scenario that the TPM sealed key is
-// invalid and needs to be recreated.
-//
-// In order to perform this action, the recovery key needs to be supplied via the recoveryKey argument. The new key is provided via
-// the key argument. The new key should be stored encrypted with SealKeyToTPM.
-//
-// Note that this operation is not atomic. It will delete the existing key from the container before configuring the keyslot with
-// the new key. This is not a problem, because this function is intended to be called in the scenario that the default key cannot
-// be used to activate the LUKS2 container.
-func ChangeLUKS2KeyUsingRecoveryKey(devicePath string, recoveryKey RecoveryKey, key []byte) error {
-	if len(key) < 32 {
-		return fmt.Errorf("expected a key length of at least 256-bits (got %d)", len(key)*8)
+func setLUKS2ContainerKey(devicePath, keyslotName string, existingKey, newKey DiskUnlockKey, options *KDFOptions,
+	newToken func(slot int) luks2.Token, priority luks2.SlotPriority) error {
+	view, err := newLUKSView(devicePath, luks2.LockModeBlocking)
+	if err != nil {
+		return xerrors.Errorf("cannot obtain LUKS header view: %w", err)
 	}
 
-	if err := luks2KillSlot(devicePath, 0, recoveryKey[:]); err != nil {
-		return xerrors.Errorf("cannot kill existing slot: %w", err)
+	removeOrphanedTokens(devicePath, view)
+
+	if token, id, exists := view.TokenByName(keyslotName); exists {
+		if len(view.UsedKeyslots()) == 1 {
+			return errors.New("cannot kill last remaining slot")
+		}
+
+		slot := token.Keyslots()[0]
+		if err := luks2KillSlot(devicePath, slot, existingKey); err != nil {
+			return xerrors.Errorf("cannot kill existing slot %d: %w", slot, err)
+		}
+
+		if err := luks2RemoveToken(devicePath, id); err != nil {
+			return xerrors.Errorf("cannot remove existing token %d: %w", id, err)
+		}
+
+		if err := view.Refresh(); err != nil {
+			return xerrors.Errorf("cannot refresh token view: %w", err)
+		}
+	}
+
+	freeSlot := 0
+	for _, slot := range view.UsedKeyslots() {
+		if slot != freeSlot {
+			break
+		}
+		freeSlot++
+	}
+
+	if err := luks2AddKey(devicePath, existingKey, newKey, &luks2.AddKeyOptions{KDFOptions: options.luksOpts(), Slot: freeSlot}); err != nil {
+		return xerrors.Errorf("cannot add key: %w", err)
+	}
+
+	// XXX: If we fail here then we end up with a used keyslot that cannot be
+	//  identified. Ideally we'd be able to add a key and token in a single
+	//  atomic operation, but this isn't even something that is possible with
+	//  the libcryptsetup API.
+	if err := luks2ImportToken(devicePath, newToken(freeSlot), nil); err != nil {
+		return xerrors.Errorf("cannot import token: %w", err)
+	}
+
+	if err := luks2SetSlotPriority(devicePath, freeSlot, priority); err != nil {
+		return xerrors.Errorf("cannot change keyslot priority: %w", err)
+	}
+
+	return nil
+}
+
+func listLUKS2ContainerKeyNames(devicePath string, typ luks2.TokenType) ([]string, error) {
+	view, err := newLUKSView(devicePath, luks2.LockModeBlocking)
+	if err != nil {
+		return nil, xerrors.Errorf("cannot obtain LUKS header view: %w", err)
+	}
+
+	var names []string
+	for _, name := range view.ListNames() {
+		token, _, _ := view.TokenByName(name)
+		if token.Type() != typ {
+			continue
+		}
+		names = append(names, name)
+	}
+
+	return names, nil
+}
+
+// SetLUKS2ContainerUnlockKey creates a keyslot with the specified name on
+// the LUKS2 container at the specified path, and uses it to protect the master
+// key with the supplied key. The created keyslot is one that will normally be
+// used for unlocking the specified LUKS2 container.
+//
+// If the specified name is empty, the name "default" will be used.
+//
+// The new key should be a cryptographically strong random number of at least
+// 32-bytes.
+//
+// If a slot with the supplied name already exists, it will be erased first.
+//
+// In order to perform this action, an existing key must be supplied. Note
+// that existingKey must be associated with a different slot - this API cannot
+// be used to change the key associated with an existing slot, and will fail
+// if this is attempted. The ability to change the key associated with an
+// existing slot is not considered useful anyway because the associated
+// KeyData has to be recreated and these 2 operations can not be done
+// atomically.
+//
+// The new key should be protected by some platform-specific mechanism in
+// order to create a KeyData object. XXX(chrisccoulson): Add documentation about
+// how to write KeyData to the new slot once a PR lands with that API.
+func SetLUKS2ContainerUnlockKey(devicePath, keyslotName string, existingKey, newKey DiskUnlockKey, options *KDFOptions) error {
+	if len(newKey) < 32 {
+		return fmt.Errorf("expected a key length of at least 256-bits (got %d)", len(newKey)*8)
+	}
+
+	if keyslotName == "" {
+		keyslotName = defaultKeyslotName
 	}
 
 	// Use a reduced cost for the KDF. This is done because we have a high entropy key rather
@@ -626,15 +741,92 @@ func ChangeLUKS2KeyUsingRecoveryKey(devicePath string, recoveryKey RecoveryKey, 
 	// protection of this key, some of which can be verified without running a KDF. For
 	// example, with a TPM sealed object, you can verify the parent storage key's seed by
 	// computing the key object's HMAC key and verifying the integrity value on the outer wrapper.
-	options := luks2.AddKeyOptions{
-		KDFOptions: luks2.KDFOptions{MemoryKiB: 32, ForceIterations: 4},
-		Slot:       0}
-	if err := luks2AddKey(devicePath, recoveryKey[:], key, &options); err != nil {
-		return xerrors.Errorf("cannot add key: %w", err)
+	if options == nil {
+		options = &KDFOptions{MemoryKiB: 32, ForceIterations: 4}
 	}
 
-	if err := luks2SetSlotPriority(devicePath, 0, luks2.SlotPriorityHigh); err != nil {
-		return xerrors.Errorf("cannot change keyslot priority: %w", err)
+	return setLUKS2ContainerKey(devicePath, keyslotName, existingKey, newKey, options, func(slot int) luks2.Token {
+		return &luksview.KeyDataToken{
+			TokenBase: luksview.TokenBase{
+				TokenKeyslot: slot,
+				TokenName:    keyslotName}}
+	}, luks2.SlotPriorityHigh)
+}
+
+// ListLUKS2ContainerUnlockKeyNames lists the names of keyslots on the specified
+// LUKS2 container configured as normal unlock slots (the keys associated with
+// these should be protected by the platform's secure device).
+func ListLUKS2ContainerUnlockKeyNames(devicePath string) ([]string, error) {
+	return listLUKS2ContainerKeyNames(devicePath, luksview.KeyDataTokenType)
+}
+
+// SetLUKS2ContainerRecoveryKey creates a fallback recovery keyslot with the
+// specified name on the LUKS2 container at the specified path and uses it to
+// protect the LUKS master key with the supplied recovery key. The keyslot can
+// be used to unlock the container in scenarios where it cannot be unlocked
+// using a platform protected key.
+//
+// If the specified name is empty, the name "default-recovery" will be used.
+//
+// The recovery key must be generated by a cryptographically strong random
+// number source.
+//
+// If a slot with the supplied name already exists, it will be erased first.
+//
+// In order to perform this action, an existing key must be supplied. Note
+// that existingKey must be associated with a different slot - this API cannot
+// be used to change the recovery key associated with an existing slot, and will
+// fail if this is attempted.
+func SetLUKS2ContainerRecoveryKey(devicePath, keyslotName string, existingKey DiskUnlockKey, recoveryKey RecoveryKey, options *KDFOptions) error {
+	if keyslotName == "" {
+		keyslotName = defaultRecoveryKeyslotName
+	}
+
+	if options == nil {
+		options = &KDFOptions{}
+	}
+
+	return setLUKS2ContainerKey(devicePath, keyslotName, existingKey, recoveryKey[:], options, func(slot int) luks2.Token {
+		return &luksview.RecoveryToken{
+			TokenBase: luksview.TokenBase{
+				TokenKeyslot: slot,
+				TokenName:    keyslotName}}
+	}, luks2.SlotPriorityNormal)
+}
+
+// ListLUKS2ContainerRecoveryKeyNames lists the names of keyslots on the specified
+// LUKS2 container configured as recovery slots.
+func ListLUKS2ContainerRecoveryKeyNames(devicePath string) ([]string, error) {
+	return listLUKS2ContainerKeyNames(devicePath, luksview.RecoveryTokenType)
+}
+
+// DeleteLUKS2ContainerKey deletes the key with the specified name from the specified
+// LUKS2 container. An existing key must be supplied. This will return an error if
+// the container only has a single keyslot remaining.
+func DeleteLUKS2ContainerKey(devicePath, keyslotName string, existingKey DiskUnlockKey) error {
+	view, err := newLUKSView(devicePath, luks2.LockModeBlocking)
+	if err != nil {
+		return xerrors.Errorf("cannot obtain LUKS header view: %w", err)
+	}
+
+	removeOrphanedTokens(devicePath, view)
+
+	token, id, exists := view.TokenByName(keyslotName)
+	if !exists {
+		return errors.New("cannot delete non-existant key")
+	}
+
+	if len(view.UsedKeyslots()) == 1 {
+		return errors.New("cannot kill last remaining slot")
+	}
+
+	slot := token.Keyslots()[0]
+	if err := luks2KillSlot(devicePath, slot, existingKey); err != nil {
+		return xerrors.Errorf("cannot kill existing slot %d: %w", slot, err)
+	}
+
+	if err := luks2RemoveToken(devicePath, id); err != nil {
+		return xerrors.Errorf("cannot remove existing token %d: %w", id, err)
 	}
 
 	return nil

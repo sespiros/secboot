@@ -27,6 +27,7 @@ import (
 	"math/rand"
 	"os"
 	"sort"
+	"strconv"
 	"time"
 
 	snapd_testutil "github.com/snapcore/snapd/testutil"
@@ -36,6 +37,7 @@ import (
 	. "github.com/snapcore/secboot"
 	"github.com/snapcore/secboot/internal/luks2"
 	"github.com/snapcore/secboot/internal/luks2/luks2test"
+	"github.com/snapcore/secboot/internal/luksview"
 	"github.com/snapcore/secboot/internal/paths/pathstest"
 	"github.com/snapcore/secboot/internal/testutil"
 )
@@ -120,6 +122,42 @@ func (r *mockAuthRequestor) RequestRecoveryKey(volumeName, sourceDevicePath stri
 
 type mockLUKS2Container struct {
 	keyslots map[int][]byte
+	tokens   map[int]luks2.Token
+}
+
+func (c *mockLUKS2Container) ReadHeader() (*luks2.HeaderInfo, error) {
+	hdr := &luks2.HeaderInfo{
+		Metadata: luks2.Metadata{
+			Keyslots: make(map[int]*luks2.Keyslot),
+			Tokens:   make(map[int]luks2.Token)}}
+
+	for id := range c.keyslots {
+		hdr.Metadata.Keyslots[id] = new(luks2.Keyslot)
+	}
+	for id, token := range c.tokens {
+		hdr.Metadata.Tokens[id] = token
+	}
+
+	return hdr, nil
+}
+
+func (c *mockLUKS2Container) newLUKSView() (*luksview.View, error) {
+	return luksview.NewViewFromCustomHeaderSource(c)
+}
+
+func (c *mockLUKS2Container) nextFreeTokenId() (id int) {
+	var ids []int
+	for i := range c.tokens {
+		ids = append(ids, i)
+	}
+	sort.Ints(ids)
+	for _, i := range ids {
+		if i != id {
+			break
+		}
+		id++
+	}
+	return id
 }
 
 func (c *mockLUKS2Container) nextFreeSlot() (slot int) {
@@ -219,7 +257,38 @@ func (l *mockLUKS2) deactivate(volumeName string) error {
 func (l *mockLUKS2) format(devicePath, label string, key []byte, options *luks2.FormatOptions) error {
 	l.operations = append(l.operations, fmt.Sprint("Format(", devicePath, ",", label, ",", options, ")"))
 
-	l.devices[devicePath] = &mockLUKS2Container{keyslots: map[int][]byte{0: key}}
+	l.devices[devicePath] = &mockLUKS2Container{
+		keyslots: map[int][]byte{0: key},
+		tokens:   make(map[int]luks2.Token)}
+	return nil
+}
+
+func (l *mockLUKS2) importToken(devicePath string, token luks2.Token, options *luks2.ImportTokenOptions) error {
+	l.operations = append(l.operations, fmt.Sprint("ImportToken(", devicePath, ",", options, ")"))
+
+	dev, ok := l.devices[devicePath]
+	if !ok {
+		return errors.New("no container")
+	}
+
+	if options == nil {
+		options = &luks2.ImportTokenOptions{Id: luks2.AnyId}
+	}
+
+	var id int
+	switch {
+	case options.Id == luks2.AnyId:
+		id = dev.nextFreeTokenId()
+	case options.Id < 0:
+		return errors.New("invalid id")
+	default:
+		if _, exists := dev.tokens[options.Id]; exists && !options.Replace {
+			return errors.New("id already in use")
+		}
+		id = options.Id
+	}
+
+	dev.tokens[id] = token
 	return nil
 }
 
@@ -245,7 +314,10 @@ func (l *mockLUKS2) killSlot(devicePath string, slot int, key []byte) error {
 		}
 	} else {
 		found := false
-		for _, k := range dev.keyslots {
+		for i, k := range dev.keyslots {
+			if i == slot {
+				continue
+			}
 			if bytes.Equal(key, k) {
 				found = true
 				break
@@ -260,6 +332,22 @@ func (l *mockLUKS2) killSlot(devicePath string, slot int, key []byte) error {
 	return nil
 }
 
+func (l *mockLUKS2) removeToken(devicePath string, id int) error {
+	l.operations = append(l.operations, "RemoveToken("+devicePath+","+strconv.Itoa(id)+")")
+
+	dev, ok := l.devices[devicePath]
+	if !ok {
+		return errors.New("no container")
+	}
+
+	if _, exists := dev.tokens[id]; !exists {
+		return errors.New("no token")
+	}
+
+	delete(dev.tokens, id)
+	return nil
+}
+
 func (l *mockLUKS2) setSlotPriority(devicePath string, slot int, priority luks2.SlotPriority) error {
 	l.operations = append(l.operations, fmt.Sprint("SetSlotPriority(", devicePath, ",", slot, ",", priority, ")"))
 
@@ -267,6 +355,16 @@ func (l *mockLUKS2) setSlotPriority(devicePath string, slot int, priority luks2.
 		return errors.New("no container")
 	}
 	return nil
+}
+
+func (l *mockLUKS2) newLUKSView(devicePath string, lockMode luks2.LockMode) (*luksview.View, error) {
+	l.operations = append(l.operations, fmt.Sprint("newLUKSView(", devicePath, ",", lockMode, ")"))
+
+	dev, ok := l.devices[devicePath]
+	if !ok {
+		return nil, errors.New("no container")
+	}
+	return dev.newLUKSView()
 }
 
 type cryptSuite struct {
@@ -304,9 +402,15 @@ func (s *cryptSuite) SetUpTest(c *C) {
 	s.AddCleanup(restore)
 	restore = MockLUKS2Format(s.luks2.format)
 	s.AddCleanup(restore)
+	restore = MockLUKS2ImportToken(s.luks2.importToken)
+	s.AddCleanup(restore)
 	restore = MockLUKS2KillSlot(s.luks2.killSlot)
 	s.AddCleanup(restore)
+	restore = MockLUKS2RemoveToken(s.luks2.removeToken)
+	s.AddCleanup(restore)
 	restore = MockLUKS2SetSlotPriority(s.luks2.setSlotPriority)
+	s.AddCleanup(restore)
+	restore = MockNewLUKSView(s.luks2.newLUKSView)
 	s.AddCleanup(restore)
 }
 
@@ -1894,10 +1998,16 @@ type testInitializeLUKS2ContainerData struct {
 }
 
 func (s *cryptSuite) testInitializeLUKS2Container(c *C, data *testInitializeLUKS2ContainerData) {
+	keyslotName := "default"
+	if data.opts != nil && data.opts.InitialKeyslotName != "" {
+		keyslotName = data.opts.InitialKeyslotName
+	}
+
 	c.Check(InitializeLUKS2Container(data.devicePath, data.label, data.key, data.opts), IsNil)
 
 	c.Check(s.luks2.operations, DeepEquals, []string{
 		fmt.Sprint("Format(", data.devicePath, ",", data.label, ",", data.fmtOpts, ")"),
+		"ImportToken(" + data.devicePath + ",<nil>)",
 		"SetSlotPriority(" + data.devicePath + ",0,prefer)"})
 
 	dev, ok := s.luks2.devices[data.devicePath]
@@ -1906,6 +2016,12 @@ func (s *cryptSuite) testInitializeLUKS2Container(c *C, data *testInitializeLUKS
 	key, ok := dev.keyslots[0]
 	c.Check(ok, testutil.IsTrue)
 	c.Check(key, DeepEquals, data.key)
+
+	var expectedToken luks2.Token = &luksview.KeyDataToken{
+		TokenBase: luksview.TokenBase{
+			TokenKeyslot: 0,
+			TokenName:    keyslotName}}
+	c.Check(dev.tokens[0], DeepEquals, expectedToken)
 }
 
 func (s *cryptSuite) TestInitializeLUKS2Container(c *C) {
@@ -1932,6 +2048,16 @@ func (s *cryptSuite) TestInitializeLUKS2ContainerWithOptions(c *C) {
 		label:      "data",
 		key:        s.newPrimaryKey(),
 		opts:       &InitializeLUKS2ContainerOptions{},
+		fmtOpts:    &luks2.FormatOptions{KDFOptions: luks2.KDFOptions{ForceIterations: 4, MemoryKiB: 32}},
+	})
+}
+
+func (s *cryptSuite) TestInitializeLUKS2ContainerWithCustomInitialKeyslotName(c *C) {
+	s.testInitializeLUKS2Container(c, &testInitializeLUKS2ContainerData{
+		devicePath: "/dev/sda1",
+		label:      "data",
+		key:        s.newPrimaryKey(),
+		opts:       &InitializeLUKS2ContainerOptions{InitialKeyslotName: "foo"},
 		fmtOpts:    &luks2.FormatOptions{KDFOptions: luks2.KDFOptions{ForceIterations: 4, MemoryKiB: 32}},
 	})
 }
@@ -1993,121 +2119,893 @@ func (s *cryptSuite) TestInitializeLUKS2ContainerInvalidKeySize(c *C) {
 	c.Check(InitializeLUKS2Container("/dev/sda1", "data", s.newPrimaryKey()[0:16], nil), ErrorMatches, "expected a key length of at least 256-bits \\(got 128\\)")
 }
 
-type testAddRecoveryKeyToLUKS2ContainerData struct {
+type testSetLUKS2ContainerUnlockKeyData struct {
 	devicePath  string
+	dev         *mockLUKS2Container
+	existingKey []byte
 	key         []byte
-	recoveryKey RecoveryKey
+	keyslotName string
+	options     *KDFOptions
+
+	expectedOptions *luks2.AddKeyOptions
+	expectedTokenId int
 }
 
-func (s *cryptSuite) testAddRecoveryKeyToLUKS2Container(c *C, data *testAddRecoveryKeyToLUKS2ContainerData) {
-	s.addMockKeyslot(data.devicePath, data.key)
+func (s *cryptSuite) testSetLUKS2ContainerUnlockKey(c *C, data *testSetLUKS2ContainerUnlockKeyData) {
+	s.luks2.devices[data.devicePath] = data.dev
 
-	c.Check(AddRecoveryKeyToLUKS2Container(data.devicePath, data.key, data.recoveryKey, nil), IsNil)
+	keyslotName := data.keyslotName
+	if keyslotName == "" {
+		keyslotName = "default"
+	}
+	options := data.options
 
-	c.Check(s.luks2.operations, DeepEquals, []string{fmt.Sprint("AddKey(", data.devicePath, ",", &luks2.AddKeyOptions{Slot: luks2.AnySlot}, ")")})
+	view, err := data.dev.newLUKSView()
+	c.Assert(err, IsNil)
 
-	dev, ok := s.luks2.devices[data.devicePath]
-	c.Assert(ok, testutil.IsTrue)
+	expected := 4 + len(view.OrphanedTokenIds())
+	token, id, exists := view.TokenByName(keyslotName)
+	if exists {
+		expected += 2
+	}
 
-	key, ok := dev.keyslots[1]
-	c.Check(ok, testutil.IsTrue)
-	c.Check(key, DeepEquals, []byte(data.recoveryKey[:]))
-}
+	c.Check(SetLUKS2ContainerUnlockKey(data.devicePath, data.keyslotName, data.existingKey, data.key, options), IsNil)
 
-func (s *cryptSuite) TestAddRecoveryKeyToLUKS2Container1(c *C) {
-	s.testAddRecoveryKeyToLUKS2Container(c, &testAddRecoveryKeyToLUKS2ContainerData{
-		devicePath:  "/dev/sda1",
-		key:         s.newPrimaryKey(),
-		recoveryKey: s.newRecoveryKey(),
-	})
-}
+	c.Assert(s.luks2.operations, HasLen, expected)
+	c.Check(s.luks2.operations[0], Equals, "newLUKSView("+data.devicePath+",0)")
 
-func (s *cryptSuite) TestAddRecoveryKeyToLUKS2Container2(c *C) {
-	// Test with different path.
-	s.testAddRecoveryKeyToLUKS2Container(c, &testAddRecoveryKeyToLUKS2ContainerData{
-		devicePath:  "/dev/vdb2",
-		key:         s.newPrimaryKey(),
-		recoveryKey: s.newRecoveryKey(),
-	})
-}
+	for i, id := range view.OrphanedTokenIds() {
+		c.Check(s.luks2.operations[1+i], Equals, "RemoveToken("+data.devicePath+","+strconv.Itoa(id)+")")
+	}
 
-func (s *cryptSuite) TestAddRecoveryKeyToLUKS2Container3(c *C) {
-	// Test with different key.
-	s.testAddRecoveryKeyToLUKS2Container(c, &testAddRecoveryKeyToLUKS2ContainerData{
-		devicePath:  "/dev/vdb2",
-		key:         make([]byte, 32),
-		recoveryKey: s.newRecoveryKey(),
-	})
-}
+	i := len(view.OrphanedTokenIds()) + 1
 
-func (s *cryptSuite) TestAddRecoveryKeyToLUKS2Container4(c *C) {
-	// Test with different recovery key.
-	s.testAddRecoveryKeyToLUKS2Container(c, &testAddRecoveryKeyToLUKS2ContainerData{
-		devicePath: "/dev/vdb2",
-		key:        s.newPrimaryKey(),
-	})
-}
+	if exists {
+		c.Check(s.luks2.operations[i:i+2], DeepEquals, []string{
+			"KillSlot(" + data.devicePath + "," + strconv.Itoa(token.Keyslots()[0]) + ")",
+			"RemoveToken(" + data.devicePath + "," + strconv.Itoa(id) + ")",
+		})
 
-type testChangeLUKS2KeyUsingRecoveryKeyData struct {
-	devicePath  string
-	recoveryKey RecoveryKey
-	key         []byte
-}
+		i += 2
+	}
 
-func (s *cryptSuite) testChangeLUKS2KeyUsingRecoveryKey(c *C, data *testChangeLUKS2KeyUsingRecoveryKeyData) {
-	s.addMockKeyslot(data.devicePath, nil)
-	s.addMockKeyslot(data.devicePath, data.recoveryKey[:])
-
-	c.Check(ChangeLUKS2KeyUsingRecoveryKey(data.devicePath, data.recoveryKey, data.key), IsNil)
-
-	c.Check(s.luks2.operations, DeepEquals, []string{
-		"KillSlot(" + data.devicePath + ",0)",
-		fmt.Sprint("AddKey(", data.devicePath, ",", &luks2.AddKeyOptions{KDFOptions: luks2.KDFOptions{ForceIterations: 4, MemoryKiB: 32}}, ")"),
-		"SetSlotPriority(" + data.devicePath + ",0,prefer)",
+	c.Check(s.luks2.operations[i:], DeepEquals, []string{
+		fmt.Sprint("AddKey(", data.devicePath, ",", data.expectedOptions, ")"),
+		"ImportToken(" + data.devicePath + ",<nil>)",
+		"SetSlotPriority(" + data.devicePath + "," + strconv.Itoa(data.expectedOptions.Slot) + ",prefer)",
 	})
 
-	dev, ok := s.luks2.devices[data.devicePath]
-	c.Assert(ok, testutil.IsTrue)
-
-	key, ok := dev.keyslots[0]
+	key, ok := data.dev.keyslots[data.expectedOptions.Slot]
 	c.Check(ok, testutil.IsTrue)
 	c.Check(key, DeepEquals, data.key)
+
+	var expectedToken luks2.Token = &luksview.KeyDataToken{
+		TokenBase: luksview.TokenBase{
+			TokenKeyslot: data.expectedOptions.Slot,
+			TokenName:    keyslotName}}
+	c.Check(data.dev.tokens[data.expectedTokenId], DeepEquals, expectedToken)
 }
 
-func (s *cryptSuite) TestChangeLUKS2KeyUsingRecoveryKey1(c *C) {
-	s.testChangeLUKS2KeyUsingRecoveryKey(c, &testChangeLUKS2KeyUsingRecoveryKeyData{
-		devicePath:  "/dev/sda1",
-		recoveryKey: s.newRecoveryKey(),
-		key:         s.newPrimaryKey(),
-	})
-}
+func (s *cryptSuite) TestSetLUKS2ContainerUnlockKey(c *C) {
+	existingKey := s.newPrimaryKey()
 
-func (s *cryptSuite) TestChangeLUKS2KeyUsingRecoveryKey2(c *C) {
-	s.testChangeLUKS2KeyUsingRecoveryKey(c, &testChangeLUKS2KeyUsingRecoveryKeyData{
-		devicePath:  "/dev/vdc1",
-		recoveryKey: s.newRecoveryKey(),
-		key:         s.newPrimaryKey(),
-	})
-}
-
-func (s *cryptSuite) TestChangeLUKS2KeyUsingRecoveryKey3(c *C) {
-	s.testChangeLUKS2KeyUsingRecoveryKey(c, &testChangeLUKS2KeyUsingRecoveryKeyData{
+	s.testSetLUKS2ContainerUnlockKey(c, &testSetLUKS2ContainerUnlockKeyData{
 		devicePath: "/dev/sda1",
-		key:        s.newPrimaryKey(),
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+			},
+			keyslots: map[int][]byte{0: existingKey},
+		},
+		existingKey:     existingKey,
+		key:             s.newPrimaryKey(),
+		keyslotName:     "foo",
+		expectedOptions: &luks2.AddKeyOptions{KDFOptions: luks2.KDFOptions{ForceIterations: 4, MemoryKiB: 32}, Slot: 1},
+		expectedTokenId: 1,
 	})
 }
 
-func (s *cryptSuite) TestChangeLUKS2KeyUsingRecoveryKey4(c *C) {
-	s.testChangeLUKS2KeyUsingRecoveryKey(c, &testChangeLUKS2KeyUsingRecoveryKeyData{
-		devicePath:  "/dev/vdc1",
-		recoveryKey: s.newRecoveryKey(),
-		key:         make([]byte, 32),
+func (s *cryptSuite) TestSetLUKS2ContainerDifferentPath(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testSetLUKS2ContainerUnlockKey(c, &testSetLUKS2ContainerUnlockKeyData{
+		devicePath: "/dev/vdb1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+			},
+			keyslots: map[int][]byte{0: existingKey},
+		},
+		existingKey:     existingKey,
+		key:             s.newPrimaryKey(),
+		keyslotName:     "foo",
+		expectedOptions: &luks2.AddKeyOptions{KDFOptions: luks2.KDFOptions{ForceIterations: 4, MemoryKiB: 32}, Slot: 1},
+		expectedTokenId: 1,
 	})
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerDifferentName(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testSetLUKS2ContainerUnlockKey(c, &testSetLUKS2ContainerUnlockKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+			},
+			keyslots: map[int][]byte{0: existingKey},
+		},
+		existingKey:     existingKey,
+		key:             s.newPrimaryKey(),
+		keyslotName:     "bar",
+		expectedOptions: &luks2.AddKeyOptions{KDFOptions: luks2.KDFOptions{ForceIterations: 4, MemoryKiB: 32}, Slot: 1},
+		expectedTokenId: 1,
+	})
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerNoName(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testSetLUKS2ContainerUnlockKey(c, &testSetLUKS2ContainerUnlockKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "foo"}},
+			},
+			keyslots: map[int][]byte{0: existingKey},
+		},
+		existingKey:     existingKey,
+		key:             s.newPrimaryKey(),
+		expectedOptions: &luks2.AddKeyOptions{KDFOptions: luks2.KDFOptions{ForceIterations: 4, MemoryKiB: 32}, Slot: 1},
+		expectedTokenId: 1,
+	})
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerExisting(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testSetLUKS2ContainerUnlockKey(c, &testSetLUKS2ContainerUnlockKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+				1: &luksview.RecoveryToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 1,
+						TokenName:    "recovery"}},
+			},
+			keyslots: map[int][]byte{
+				0: s.newPrimaryKey(),
+				1: existingKey,
+			},
+		},
+		existingKey:     existingKey,
+		key:             s.newPrimaryKey(),
+		keyslotName:     "default",
+		expectedOptions: &luks2.AddKeyOptions{KDFOptions: luks2.KDFOptions{ForceIterations: 4, MemoryKiB: 32}, Slot: 0},
+		expectedTokenId: 0,
+	})
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerUnlockKeyWithOrphanedTokens(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testSetLUKS2ContainerUnlockKey(c, &testSetLUKS2ContainerUnlockKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+				1: luksview.NewOrphanedTokenForTesting(luksview.KeyDataTokenType, "bar"),
+			},
+			keyslots: map[int][]byte{0: existingKey},
+		},
+		existingKey:     existingKey,
+		key:             s.newPrimaryKey(),
+		keyslotName:     "foo",
+		expectedOptions: &luks2.AddKeyOptions{KDFOptions: luks2.KDFOptions{ForceIterations: 4, MemoryKiB: 32}, Slot: 1},
+		expectedTokenId: 1,
+	})
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerUnlockKeyWithExternalKeyslots(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testSetLUKS2ContainerUnlockKey(c, &testSetLUKS2ContainerUnlockKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+			},
+			keyslots: map[int][]byte{
+				0:  existingKey,
+				1:  nil,
+				2:  nil,
+				3:  nil,
+				10: nil,
+			},
+		},
+		existingKey:     existingKey,
+		key:             s.newPrimaryKey(),
+		keyslotName:     "foo",
+		expectedOptions: &luks2.AddKeyOptions{KDFOptions: luks2.KDFOptions{ForceIterations: 4, MemoryKiB: 32}, Slot: 4},
+		expectedTokenId: 1,
+	})
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerUnlockKeyWithCustomKDFTime(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testSetLUKS2ContainerUnlockKey(c, &testSetLUKS2ContainerUnlockKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+			},
+			keyslots: map[int][]byte{0: existingKey},
+		},
+		existingKey:     existingKey,
+		key:             s.newPrimaryKey(),
+		keyslotName:     "foo",
+		options:         &KDFOptions{TargetDuration: 100 * time.Millisecond},
+		expectedOptions: &luks2.AddKeyOptions{KDFOptions: luks2.KDFOptions{TargetDuration: 100 * time.Millisecond}, Slot: 1},
+		expectedTokenId: 1,
+	})
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerUnlockKeyWithCustomKDFMemory(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testSetLUKS2ContainerUnlockKey(c, &testSetLUKS2ContainerUnlockKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+			},
+			keyslots: map[int][]byte{0: existingKey},
+		},
+		existingKey:     existingKey,
+		key:             s.newPrimaryKey(),
+		keyslotName:     "foo",
+		options:         &KDFOptions{MemoryKiB: 64},
+		expectedOptions: &luks2.AddKeyOptions{KDFOptions: luks2.KDFOptions{MemoryKiB: 64}, Slot: 1},
+		expectedTokenId: 1,
+	})
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerUnlockKeyWithCustomKDFIterations(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testSetLUKS2ContainerUnlockKey(c, &testSetLUKS2ContainerUnlockKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+			},
+			keyslots: map[int][]byte{0: existingKey},
+		},
+		existingKey:     existingKey,
+		key:             s.newPrimaryKey(),
+		keyslotName:     "foo",
+		options:         &KDFOptions{ForceIterations: 10},
+		expectedOptions: &luks2.AddKeyOptions{KDFOptions: luks2.KDFOptions{ForceIterations: 10}, Slot: 1},
+		expectedTokenId: 1,
+	})
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerUnlockKeyReplaceLastSlot(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.luks2.devices["/dev/sda1"] = &mockLUKS2Container{
+		tokens: map[int]luks2.Token{
+			0: &luksview.KeyDataToken{
+				TokenBase: luksview.TokenBase{
+					TokenKeyslot: 0,
+					TokenName:    "default"}},
+		},
+		keyslots: map[int][]byte{0: existingKey},
+	}
+	c.Check(SetLUKS2ContainerUnlockKey("/dev/sda1", "default", existingKey, make([]byte, 32), nil), ErrorMatches, "cannot kill last remaining slot")
+}
+
+func (s *cryptSuite) TestListLUKS2ContainerKeyNames(c *C) {
+	s.luks2.devices["/dev/sda1"] = &mockLUKS2Container{
+		tokens: map[int]luks2.Token{
+			0: &luksview.KeyDataToken{
+				TokenBase: luksview.TokenBase{
+					TokenKeyslot: 0,
+					TokenName:    "default"}},
+			1: &luksview.RecoveryToken{
+				TokenBase: luksview.TokenBase{
+					TokenKeyslot: 1,
+					TokenName:    "recovery"}},
+			2: &luksview.KeyDataToken{
+				TokenBase: luksview.TokenBase{
+					TokenKeyslot: 2,
+					TokenName:    "foo"}},
+			3: luksview.NewOrphanedTokenForTesting(luksview.KeyDataTokenType, "orphaned"),
+		},
+		keyslots: map[int][]byte{
+			0: nil,
+			1: nil,
+			2: nil,
+		},
+	}
+
+	names, err := ListLUKS2ContainerUnlockKeyNames("/dev/sda1")
+	c.Check(err, IsNil)
+	c.Check(names, DeepEquals, []string{"default", "foo"})
+
+	names, err = ListLUKS2ContainerRecoveryKeyNames("/dev/sda1")
+	c.Check(err, IsNil)
+	c.Check(names, DeepEquals, []string{"recovery"})
+
+	c.Check(s.luks2.operations, DeepEquals, []string{
+		"newLUKSView(/dev/sda1,0)",
+		"newLUKSView(/dev/sda1,0)",
+	})
+}
+
+type testSetLUKS2ContainerRecoveryKeyData struct {
+	devicePath  string
+	dev         *mockLUKS2Container
+	existingKey []byte
+	key         RecoveryKey
+	keyslotName string
+	options     *KDFOptions
+
+	expectedOptions *luks2.AddKeyOptions
+	expectedTokenId int
+}
+
+func (s *cryptSuite) testSetLUKS2ContainerRecoveryKey(c *C, data *testSetLUKS2ContainerRecoveryKeyData) {
+	s.luks2.devices[data.devicePath] = data.dev
+
+	keyslotName := data.keyslotName
+	if keyslotName == "" {
+		keyslotName = "default-recovery"
+	}
+	options := data.options
+
+	view, err := data.dev.newLUKSView()
+	c.Assert(err, IsNil)
+
+	expected := 4 + len(view.OrphanedTokenIds())
+	token, id, exists := view.TokenByName(keyslotName)
+	if exists {
+		expected += 2
+	}
+
+	c.Check(SetLUKS2ContainerRecoveryKey(data.devicePath, data.keyslotName, data.existingKey, data.key, options), IsNil)
+
+	c.Assert(s.luks2.operations, HasLen, expected)
+	c.Check(s.luks2.operations[0], Equals, "newLUKSView("+data.devicePath+",0)")
+
+	for i, id := range view.OrphanedTokenIds() {
+		c.Check(s.luks2.operations[1+i], Equals, "RemoveToken("+data.devicePath+","+strconv.Itoa(id)+")")
+	}
+
+	i := len(view.OrphanedTokenIds()) + 1
+
+	if exists {
+		c.Check(s.luks2.operations[i:i+2], DeepEquals, []string{
+			"KillSlot(" + data.devicePath + "," + strconv.Itoa(token.Keyslots()[0]) + ")",
+			"RemoveToken(" + data.devicePath + "," + strconv.Itoa(id) + ")",
+		})
+
+		i += 2
+	}
+
+	c.Check(s.luks2.operations[i:], DeepEquals, []string{
+		fmt.Sprint("AddKey(", data.devicePath, ",", data.expectedOptions, ")"),
+		"ImportToken(" + data.devicePath + ",<nil>)",
+		"SetSlotPriority(" + data.devicePath + "," + strconv.Itoa(data.expectedOptions.Slot) + ",normal)",
+	})
+
+	key, ok := data.dev.keyslots[data.expectedOptions.Slot]
+	c.Check(ok, testutil.IsTrue)
+	c.Check(key, DeepEquals, []byte(data.key[:]))
+
+	var expectedToken luks2.Token = &luksview.RecoveryToken{
+		TokenBase: luksview.TokenBase{
+			TokenKeyslot: data.expectedOptions.Slot,
+			TokenName:    keyslotName}}
+	c.Check(data.dev.tokens[data.expectedTokenId], DeepEquals, expectedToken)
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerRecoveryKey(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testSetLUKS2ContainerRecoveryKey(c, &testSetLUKS2ContainerRecoveryKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+			},
+			keyslots: map[int][]byte{0: existingKey},
+		},
+		existingKey:     existingKey,
+		key:             s.newRecoveryKey(),
+		keyslotName:     "recovery",
+		expectedOptions: &luks2.AddKeyOptions{Slot: 1},
+		expectedTokenId: 1,
+	})
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerRecoveryKeyDifferentPath(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testSetLUKS2ContainerRecoveryKey(c, &testSetLUKS2ContainerRecoveryKeyData{
+		devicePath: "/dev/vdb2",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+			},
+			keyslots: map[int][]byte{0: existingKey},
+		},
+		existingKey:     existingKey,
+		key:             s.newRecoveryKey(),
+		keyslotName:     "recovery",
+		expectedOptions: &luks2.AddKeyOptions{Slot: 1},
+		expectedTokenId: 1,
+	})
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerRecoveryKeyDifferentName(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testSetLUKS2ContainerRecoveryKey(c, &testSetLUKS2ContainerRecoveryKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+			},
+			keyslots: map[int][]byte{0: existingKey},
+		},
+		existingKey:     existingKey,
+		key:             s.newRecoveryKey(),
+		keyslotName:     "foo",
+		expectedOptions: &luks2.AddKeyOptions{Slot: 1},
+		expectedTokenId: 1,
+	})
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerRecoveryKeyNoName(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testSetLUKS2ContainerRecoveryKey(c, &testSetLUKS2ContainerRecoveryKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+			},
+			keyslots: map[int][]byte{0: existingKey},
+		},
+		existingKey:     existingKey,
+		key:             s.newRecoveryKey(),
+		expectedOptions: &luks2.AddKeyOptions{Slot: 1},
+		expectedTokenId: 1,
+	})
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerRecoveryKeyExisting(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testSetLUKS2ContainerRecoveryKey(c, &testSetLUKS2ContainerRecoveryKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+				1: &luksview.RecoveryToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 1,
+						TokenName:    "recovery"}},
+			},
+			keyslots: map[int][]byte{
+				0: existingKey,
+				1: s.newPrimaryKey(),
+			},
+		},
+		existingKey:     existingKey,
+		key:             s.newRecoveryKey(),
+		keyslotName:     "recovery",
+		expectedOptions: &luks2.AddKeyOptions{Slot: 1},
+		expectedTokenId: 1,
+	})
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerRecoveryKeyWithOrphanedTokens(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testSetLUKS2ContainerRecoveryKey(c, &testSetLUKS2ContainerRecoveryKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+				1: luksview.NewOrphanedTokenForTesting(luksview.RecoveryTokenType, "recovery"),
+			},
+			keyslots: map[int][]byte{0: existingKey},
+		},
+		existingKey:     existingKey,
+		key:             s.newRecoveryKey(),
+		keyslotName:     "recovery",
+		expectedOptions: &luks2.AddKeyOptions{Slot: 1},
+		expectedTokenId: 1,
+	})
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerRecoveryKeyWithExternalKeyslots(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testSetLUKS2ContainerRecoveryKey(c, &testSetLUKS2ContainerRecoveryKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+			},
+			keyslots: map[int][]byte{
+				0: existingKey,
+				1: nil,
+				2: nil,
+				3: nil,
+				4: nil,
+				5: nil,
+				9: nil,
+			},
+		},
+		existingKey:     existingKey,
+		key:             s.newRecoveryKey(),
+		keyslotName:     "recovery",
+		expectedOptions: &luks2.AddKeyOptions{Slot: 6},
+		expectedTokenId: 1,
+	})
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerRecoveryKeyWithCustomKDFTime(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testSetLUKS2ContainerRecoveryKey(c, &testSetLUKS2ContainerRecoveryKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+			},
+			keyslots: map[int][]byte{0: existingKey},
+		},
+		existingKey:     existingKey,
+		key:             s.newRecoveryKey(),
+		keyslotName:     "recovery",
+		options:         &KDFOptions{TargetDuration: 5 * time.Second},
+		expectedOptions: &luks2.AddKeyOptions{KDFOptions: luks2.KDFOptions{TargetDuration: 5 * time.Second}, Slot: 1},
+		expectedTokenId: 1,
+	})
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerRecoveryKeyWithCustomKDFMemory(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testSetLUKS2ContainerRecoveryKey(c, &testSetLUKS2ContainerRecoveryKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+			},
+			keyslots: map[int][]byte{0: existingKey},
+		},
+		existingKey:     existingKey,
+		key:             s.newRecoveryKey(),
+		keyslotName:     "recovery",
+		options:         &KDFOptions{MemoryKiB: 2 * 1024 * 1024},
+		expectedOptions: &luks2.AddKeyOptions{KDFOptions: luks2.KDFOptions{MemoryKiB: 2 * 1024 * 1024}, Slot: 1},
+		expectedTokenId: 1,
+	})
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerRecoveryKeyWithCustomKDFIterations(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testSetLUKS2ContainerRecoveryKey(c, &testSetLUKS2ContainerRecoveryKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+			},
+			keyslots: map[int][]byte{0: existingKey},
+		},
+		existingKey:     existingKey,
+		key:             s.newRecoveryKey(),
+		keyslotName:     "recovery",
+		options:         &KDFOptions{ForceIterations: 10},
+		expectedOptions: &luks2.AddKeyOptions{KDFOptions: luks2.KDFOptions{ForceIterations: 10}, Slot: 1},
+		expectedTokenId: 1,
+	})
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerRecoveryKeyDifferentSlot(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testSetLUKS2ContainerRecoveryKey(c, &testSetLUKS2ContainerRecoveryKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+			},
+			keyslots: map[int][]byte{
+				0: existingKey,
+				1: nil,
+			},
+		},
+		existingKey:     existingKey,
+		key:             s.newRecoveryKey(),
+		keyslotName:     "recovery",
+		expectedOptions: &luks2.AddKeyOptions{Slot: 2},
+		expectedTokenId: 1,
+	})
+}
+
+func (s *cryptSuite) TestSetLUKS2ContainerRecoveryKeyReplaceLastSlot(c *C) {
+	existingKey := s.newRecoveryKey()
+
+	s.luks2.devices["/dev/sda1"] = &mockLUKS2Container{
+		tokens: map[int]luks2.Token{
+			0: &luksview.RecoveryToken{
+				TokenBase: luksview.TokenBase{
+					TokenKeyslot: 0,
+					TokenName:    "recovery"}},
+		},
+		keyslots: map[int][]byte{0: existingKey[:]},
+	}
+	c.Check(SetLUKS2ContainerRecoveryKey("/dev/sda1", "recovery", existingKey[:], RecoveryKey{}, nil), ErrorMatches, "cannot kill last remaining slot")
+}
+
+type testDeleteLUKS2ContainerKeyData struct {
+	devicePath  string
+	dev         *mockLUKS2Container
+	keyslotName string
+	existingKey []byte
+	slot        int
+	tokenId     int
+}
+
+func (s *cryptSuite) testDeleteLUKS2ContainerKey(c *C, data *testDeleteLUKS2ContainerKeyData) {
+	s.luks2.devices[data.devicePath] = data.dev
+
+	c.Check(DeleteLUKS2ContainerKey(data.devicePath, data.keyslotName, data.existingKey), IsNil)
+
+	c.Check(s.luks2.operations, DeepEquals, []string{
+		"newLUKSView(" + data.devicePath + ",0)",
+		"KillSlot(" + data.devicePath + "," + strconv.Itoa(data.slot) + ")",
+		"RemoveToken(" + data.devicePath + "," + strconv.Itoa(data.tokenId) + ")",
+	})
+}
+
+func (s *cryptSuite) TestDeleteLUKS2ContainerKey(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testDeleteLUKS2ContainerKey(c, &testDeleteLUKS2ContainerKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+				1: &luksview.RecoveryToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 1,
+						TokenName:    "default-recovery"}},
+			},
+			keyslots: map[int][]byte{
+				0: existingKey,
+				1: nil,
+			},
+		},
+		keyslotName: "default-recovery",
+		existingKey: existingKey,
+		slot:        1,
+		tokenId:     1,
+	})
+}
+
+func (s *cryptSuite) TestDeleteLUKS2ContainerKeyDifferentPath(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testDeleteLUKS2ContainerKey(c, &testDeleteLUKS2ContainerKeyData{
+		devicePath: "/dev/nvme0n1p1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+				1: &luksview.RecoveryToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 1,
+						TokenName:    "default-recovery"}},
+			},
+			keyslots: map[int][]byte{
+				0: existingKey,
+				1: nil,
+			},
+		},
+		keyslotName: "default-recovery",
+		existingKey: existingKey,
+		slot:        1,
+		tokenId:     1,
+	})
+}
+
+func (s *cryptSuite) TestDeleteLUKS2ContainerKeyDifferentName(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testDeleteLUKS2ContainerKey(c, &testDeleteLUKS2ContainerKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+				1: &luksview.RecoveryToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 1,
+						TokenName:    "foo"}},
+			},
+			keyslots: map[int][]byte{
+				0: existingKey,
+				1: nil,
+			},
+		},
+		keyslotName: "foo",
+		existingKey: existingKey,
+		slot:        1,
+		tokenId:     1,
+	})
+}
+
+func (s *cryptSuite) TestDeleteLUKS2ContainerKeyDifferentKeyslot(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testDeleteLUKS2ContainerKey(c, &testDeleteLUKS2ContainerKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+				1: &luksview.RecoveryToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 2,
+						TokenName:    "default-recovery"}},
+			},
+			keyslots: map[int][]byte{
+				0: existingKey,
+				2: nil,
+			},
+		},
+		keyslotName: "default-recovery",
+		existingKey: existingKey,
+		slot:        2,
+		tokenId:     1,
+	})
+}
+
+func (s *cryptSuite) TestDeleteLUKS2ContainerKeyDifferentTokenId(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.testDeleteLUKS2ContainerKey(c, &testDeleteLUKS2ContainerKeyData{
+		devicePath: "/dev/sda1",
+		dev: &mockLUKS2Container{
+			tokens: map[int]luks2.Token{
+				0: &luksview.KeyDataToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 0,
+						TokenName:    "default"}},
+				4: &luksview.RecoveryToken{
+					TokenBase: luksview.TokenBase{
+						TokenKeyslot: 1,
+						TokenName:    "default-recovery"}},
+			},
+			keyslots: map[int][]byte{
+				0: existingKey,
+				1: nil,
+			},
+		},
+		keyslotName: "default-recovery",
+		existingKey: existingKey,
+		slot:        1,
+		tokenId:     4,
+	})
+}
+
+func (s *cryptSuite) TestDeleteLUKS2ContainerKeyLastSlot(c *C) {
+	existingKey := s.newPrimaryKey()
+
+	s.luks2.devices["/dev/sda1"] = &mockLUKS2Container{
+		tokens: map[int]luks2.Token{
+			0: &luksview.KeyDataToken{
+				TokenBase: luksview.TokenBase{
+					TokenKeyslot: 0,
+					TokenName:    "default"}},
+		},
+		keyslots: map[int][]byte{0: existingKey},
+	}
+
+	c.Check(DeleteLUKS2ContainerKey("/dev/sda1", "default", existingKey), ErrorMatches, "cannot kill last remaining slot")
 }
 
 type cryptSuiteUnmockedBase struct {
 	snapd_testutil.BaseTest
 	cryptTestBase
+}
+
+func (s *cryptSuiteUnmockedBase) SetUpSuite(c *C) {
+	if luks2.DetectCryptsetupFeatures()&luks2.FeatureTokenImport == 0 {
+		c.Skip("cryptsetup doesn't support token import")
+	}
 }
 
 func (s *cryptSuiteUnmockedBase) SetUpTest(c *C) {
@@ -2128,6 +3026,7 @@ func (s *cryptSuiteUnmockedExpensive) SetUpSuite(c *C) {
 	if _, exists := os.LookupEnv("NO_EXPENSIVE_CRYPTSETUP_TESTS"); exists {
 		c.Skip("skipping expensive cryptsetup tests")
 	}
+	s.cryptSuiteUnmockedBase.SetUpSuite(c)
 }
 
 var _ = Suite(&cryptSuiteUnmocked{})
@@ -2139,10 +3038,10 @@ func (s *cryptSuiteUnmockedBase) testInitializeLUKS2Container(c *C, options *Ini
 
 	c.Check(InitializeLUKS2Container(path, "data", key, options), IsNil)
 
-	switch {
-	case options == nil:
-		options = &InitializeLUKS2ContainerOptions{KDFOptions: &KDFOptions{MemoryKiB: 32, ForceIterations: 4}}
-	case options.KDFOptions == nil:
+	if options == nil {
+		options = &InitializeLUKS2ContainerOptions{}
+	}
+	if options.KDFOptions == nil {
 		options.KDFOptions = &KDFOptions{MemoryKiB: 32, ForceIterations: 4}
 	}
 
@@ -2156,7 +3055,17 @@ func (s *cryptSuiteUnmockedBase) testInitializeLUKS2Container(c *C, options *Ini
 	c.Assert(ok, Equals, true)
 	c.Check(keyslot.Priority, Equals, luks2.SlotPriorityHigh)
 
-	c.Check(info.Metadata.Tokens, HasLen, 0)
+	expectedName := "default"
+	if options.InitialKeyslotName != "" {
+		expectedName = options.InitialKeyslotName
+	}
+
+	c.Check(info.Metadata.Tokens, HasLen, 1)
+	c.Check(info.Metadata.Tokens[0], DeepEquals, luks2.Token(&luksview.KeyDataToken{
+		TokenBase: luksview.TokenBase{
+			TokenKeyslot: 0,
+			TokenName:    expectedName},
+		Priority: 0}))
 
 	expectedMetadataSize := uint64(16 * 1024)
 	if options.MetadataKiBSize > 0 {
@@ -2178,6 +3087,7 @@ func (s *cryptSuiteUnmockedBase) testInitializeLUKS2Container(c *C, options *Ini
 	if options.KDFOptions.ForceIterations > 0 {
 		c.Check(keyslot.KDF.Time, Equals, options.KDFOptions.ForceIterations)
 		c.Check(keyslot.KDF.Memory, Equals, expectedMemoryKiB)
+		luks2test.CheckLUKS2Passphrase(c, path, key)
 	} else {
 		expectedKDFTime := 2 * time.Second
 		if options.KDFOptions.TargetDuration > 0 {
@@ -2200,7 +3110,7 @@ func (s *cryptSuiteUnmocked) TestInitializeLUKS2Container(c *C) {
 	s.testInitializeLUKS2Container(c, nil)
 }
 
-func (s *cryptSuiteUnmocked) TestInitializeLUKS2ContainerWithOptions(c *C) {
+func (s *cryptSuiteUnmocked) TestInitializeLUKS2ContainerWithCustomMetadataSize(c *C) {
 	if luks2.DetectCryptsetupFeatures()&luks2.FeatureHeaderSizeSetting == 0 {
 		c.Skip("cryptsetup doesn't support --luks2-metadata-size or --luks2-keyslots-size")
 	}
@@ -2208,6 +3118,13 @@ func (s *cryptSuiteUnmocked) TestInitializeLUKS2ContainerWithOptions(c *C) {
 	s.testInitializeLUKS2Container(c, &InitializeLUKS2ContainerOptions{
 		MetadataKiBSize:     2 * 1024, // 2MiB
 		KeyslotsAreaKiBSize: 3 * 1024, // 3MiB
+		InitialKeyslotName:  "foo",
+	})
+}
+
+func (s *cryptSuiteUnmocked) TestInitializeLUKS2ContainerWithCustomKeyslotName(c *C) {
+	s.testInitializeLUKS2Container(c, &InitializeLUKS2ContainerOptions{
+		InitialKeyslotName: "foo",
 	})
 }
 
@@ -2218,67 +3135,227 @@ func (s *cryptSuiteUnmockedExpensive) TestInitializeLUKS2ContainerWithCustomKDFT
 
 func (s *cryptSuiteUnmockedExpensive) TestInitializeLUKS2ContainerWithCustomKDFMemory(c *C) {
 	s.testInitializeLUKS2Container(c, &InitializeLUKS2ContainerOptions{
-		KDFOptions: &KDFOptions{TargetDuration: 100 * time.Millisecond, MemoryKiB: 64}})
+		KDFOptions: &KDFOptions{MemoryKiB: 64}})
 }
 
 func (s *cryptSuiteUnmocked) TestInitializeLUKS2ContainerWithCustomKDFIterations(c *C) {
 	s.testInitializeLUKS2Container(c, &InitializeLUKS2ContainerOptions{
-		KDFOptions: &KDFOptions{ForceIterations: 8}})
+		KDFOptions: &KDFOptions{MemoryKiB: 32, ForceIterations: 8}})
 }
 
-func (s *cryptSuiteUnmockedExpensive) TestAddRecoveryKeyToLUKS2Container(c *C) {
+type testSetLUKS2ContainerUnlockKeyUnmockedData struct {
+	keyslotName string
+	options     *KDFOptions
+}
+
+func (s *cryptSuiteUnmockedBase) testSetLUKS2ContainerUnlockKey(c *C, data *testSetLUKS2ContainerUnlockKeyUnmockedData) {
 	key := s.newPrimaryKey()
 	path := luks2test.CreateEmptyDiskImage(c, 20)
 
-	c.Check(InitializeLUKS2Container(path, "", key, nil), IsNil)
+	c.Check(InitializeLUKS2Container(path, "data", key, nil), IsNil)
 
-	startInfo, err := luks2.ReadHeader(path, luks2.LockModeBlocking)
-	c.Assert(err, IsNil)
+	newKey := s.newPrimaryKey()
+	c.Check(SetLUKS2ContainerUnlockKey(path, data.keyslotName, key, newKey, data.options), IsNil)
 
-	recoveryKey := s.newRecoveryKey()
-	c.Check(AddRecoveryKeyToLUKS2Container(path, key, recoveryKey, nil), IsNil)
-
-	endInfo, err := luks2.ReadHeader(path, luks2.LockModeBlocking)
-	c.Assert(err, IsNil)
-
-	newSlotId := -1
-	for s := range endInfo.Metadata.Keyslots {
-		if _, ok := startInfo.Metadata.Keyslots[s]; !ok {
-			newSlotId = int(s)
-			break
-		}
+	options := data.options
+	if options == nil {
+		options = &KDFOptions{MemoryKiB: 32, ForceIterations: 4}
 	}
 
-	c.Assert(newSlotId, snapd_testutil.IntGreaterThan, -1)
+	expectedName := "default"
+	if data.keyslotName != "" {
+		expectedName = data.keyslotName
+	}
 
-	c.Check(endInfo.Metadata.Keyslots, HasLen, 2)
-	keyslot, ok := endInfo.Metadata.Keyslots[newSlotId]
+	info, err := luks2.ReadHeader(path, luks2.LockModeBlocking)
+	c.Assert(err, IsNil)
+
+	c.Check(info.Metadata.Keyslots, HasLen, 2)
+	keyslot, ok := info.Metadata.Keyslots[1]
+	c.Assert(ok, Equals, true)
+	c.Check(keyslot.Priority, Equals, luks2.SlotPriorityHigh)
+
+	c.Check(info.Metadata.Tokens, HasLen, 2)
+	c.Check(info.Metadata.Tokens[1], DeepEquals, luks2.Token(&luksview.KeyDataToken{
+		TokenBase: luksview.TokenBase{
+			TokenKeyslot: 1,
+			TokenName:    expectedName},
+		Priority: 0}))
+
+	expectedMemoryKiB := 1 * 1024 * 1024
+	if options.MemoryKiB > 0 {
+		expectedMemoryKiB = options.MemoryKiB
+	}
+
+	if options.ForceIterations > 0 {
+		c.Check(keyslot.KDF.Time, Equals, options.ForceIterations)
+		c.Check(keyslot.KDF.Memory, Equals, expectedMemoryKiB)
+		luks2test.CheckLUKS2Passphrase(c, path, newKey)
+	} else {
+		expectedKDFTime := 2 * time.Second
+		if options.TargetDuration > 0 {
+			expectedKDFTime = options.TargetDuration
+		}
+
+		c.Check(keyslot.KDF.Memory, snapd_testutil.IntLessEqual, expectedMemoryKiB)
+
+		start := time.Now()
+		luks2test.CheckLUKS2Passphrase(c, path, newKey)
+		elapsed := time.Now().Sub(start)
+
+		// Check KDF time here with +/-20% tolerance and additional 500ms for cryptsetup exec and other activities
+		c.Check(int(elapsed/time.Millisecond), snapd_testutil.IntGreaterThan, int(float64(expectedKDFTime/time.Millisecond)*0.8))
+		c.Check(int(elapsed/time.Millisecond), snapd_testutil.IntLessThan, int(float64(expectedKDFTime/time.Millisecond)*1.2)+500)
+	}
+
+	luks2test.CheckLUKS2Passphrase(c, path, key)
+}
+
+func (s *cryptSuiteUnmocked) TestSetLUKS2ContainerUnlockKey(c *C) {
+	s.testSetLUKS2ContainerUnlockKey(c, &testSetLUKS2ContainerUnlockKeyUnmockedData{
+		keyslotName: "foo",
+	})
+}
+
+func (s *cryptSuiteUnmocked) TestSetLUKS2ContainerUnlockKeyDifferentName(c *C) {
+	s.testSetLUKS2ContainerUnlockKey(c, &testSetLUKS2ContainerUnlockKeyUnmockedData{
+		keyslotName: "bar",
+	})
+}
+
+func (s *cryptSuiteUnmockedExpensive) TestSetLUKS2ContainerUnlockKeyWithCustomKDFTime(c *C) {
+	s.testSetLUKS2ContainerUnlockKey(c, &testSetLUKS2ContainerUnlockKeyUnmockedData{
+		keyslotName: "foo",
+		options:     &KDFOptions{TargetDuration: 100 * time.Millisecond},
+	})
+}
+
+func (s *cryptSuiteUnmockedExpensive) TestSetLUKS2ContainerUnlockKeyWithCustomKDFMemory(c *C) {
+	s.testSetLUKS2ContainerUnlockKey(c, &testSetLUKS2ContainerUnlockKeyUnmockedData{
+		keyslotName: "foo",
+		options:     &KDFOptions{MemoryKiB: 64},
+	})
+}
+
+func (s *cryptSuiteUnmocked) TestSetLUKS2ContainerUnlockKeyWithCustomKDFIterations(c *C) {
+	s.testSetLUKS2ContainerUnlockKey(c, &testSetLUKS2ContainerUnlockKeyUnmockedData{
+		keyslotName: "foo",
+		options:     &KDFOptions{MemoryKiB: 32, ForceIterations: 8},
+	})
+}
+
+type testSetLUKS2ContainerRecoveryKeyUnmockedData struct {
+	keyslotName string
+	options     *KDFOptions
+}
+
+func (s *cryptSuiteUnmockedBase) testSetLUKS2ContainerRecoveryKey(c *C, data *testSetLUKS2ContainerRecoveryKeyUnmockedData) {
+	key := s.newPrimaryKey()
+	path := luks2test.CreateEmptyDiskImage(c, 20)
+
+	c.Check(InitializeLUKS2Container(path, "data", key, nil), IsNil)
+
+	var recoveryKey RecoveryKey
+	rand.Read(recoveryKey[:])
+	c.Check(SetLUKS2ContainerRecoveryKey(path, data.keyslotName, key, recoveryKey, data.options), IsNil)
+
+	options := data.options
+	if options == nil {
+		options = &KDFOptions{}
+	}
+
+	expectedName := "default-recovery"
+	if data.keyslotName != "" {
+		expectedName = data.keyslotName
+	}
+
+	info, err := luks2.ReadHeader(path, luks2.LockModeBlocking)
+	c.Assert(err, IsNil)
+
+	c.Check(info.Metadata.Keyslots, HasLen, 2)
+	keyslot, ok := info.Metadata.Keyslots[1]
 	c.Assert(ok, Equals, true)
 	c.Check(keyslot.Priority, Equals, luks2.SlotPriorityNormal)
 
-	expectedKDFTime := 2000 * time.Millisecond
+	c.Check(info.Metadata.Tokens, HasLen, 2)
+	c.Check(info.Metadata.Tokens[1], DeepEquals, luks2.Token(&luksview.RecoveryToken{
+		TokenBase: luksview.TokenBase{
+			TokenKeyslot: 1,
+			TokenName:    expectedName}}))
 
-	start := time.Now()
-	luks2test.CheckLUKS2Passphrase(c, path, recoveryKey[:])
-	elapsed := time.Now().Sub(start)
+	expectedMemoryKiB := 1 * 1024 * 1024
+	if options.MemoryKiB > 0 {
+		expectedMemoryKiB = options.MemoryKiB
+	}
 
-	// Check KDF time here with +/-20% tolerance and additional 500ms for cryptsetup exec and other activities
-	c.Check(int(elapsed/time.Millisecond), snapd_testutil.IntGreaterThan, int(float64(expectedKDFTime/time.Millisecond)*0.8))
-	c.Check(int(elapsed/time.Millisecond), snapd_testutil.IntLessThan, int(float64(expectedKDFTime/time.Millisecond)*1.2)+500)
+	if options.ForceIterations > 0 {
+		c.Check(keyslot.KDF.Time, Equals, options.ForceIterations)
+		c.Check(keyslot.KDF.Memory, Equals, expectedMemoryKiB)
+		luks2test.CheckLUKS2Passphrase(c, path, recoveryKey[:])
+	} else {
+		expectedKDFTime := 2 * time.Second
+		if options.TargetDuration > 0 {
+			expectedKDFTime = options.TargetDuration
+		}
+
+		c.Check(keyslot.KDF.Memory, snapd_testutil.IntLessEqual, expectedMemoryKiB)
+
+		start := time.Now()
+		luks2test.CheckLUKS2Passphrase(c, path, recoveryKey[:])
+		elapsed := time.Now().Sub(start)
+
+		// Check KDF time here with +/-20% tolerance and additional 500ms for cryptsetup exec and other activities
+		c.Check(int(elapsed/time.Millisecond), snapd_testutil.IntGreaterThan, int(float64(expectedKDFTime/time.Millisecond)*0.8))
+		c.Check(int(elapsed/time.Millisecond), snapd_testutil.IntLessThan, int(float64(expectedKDFTime/time.Millisecond)*1.2)+500)
+	}
+
+	luks2test.CheckLUKS2Passphrase(c, path, key)
 }
 
-func (s *cryptSuiteUnmocked) ChangeLUKS2KeyUsingRecoveryKey(c *C) {
+func (s *cryptSuiteUnmockedExpensive) TestSetLUKS2ContainerRecoveryKey(c *C) {
+	s.testSetLUKS2ContainerRecoveryKey(c, &testSetLUKS2ContainerRecoveryKeyUnmockedData{})
+}
+
+func (s *cryptSuiteUnmockedExpensive) TestSetLUKS2ContainerRecoveryKeyDifferentName(c *C) {
+	s.testSetLUKS2ContainerRecoveryKey(c, &testSetLUKS2ContainerRecoveryKeyUnmockedData{
+		keyslotName: "foo",
+	})
+}
+
+func (s *cryptSuiteUnmockedExpensive) TestSetLUKS2ContainerRecoveryKeyWithCustomKDFTime(c *C) {
+	s.testSetLUKS2ContainerRecoveryKey(c, &testSetLUKS2ContainerRecoveryKeyUnmockedData{
+		options: &KDFOptions{TargetDuration: 100 * time.Millisecond},
+	})
+}
+
+func (s *cryptSuiteUnmockedExpensive) TestSetLUKS2ContainerRecoveryKeyWithCustomKDFMemory(c *C) {
+	s.testSetLUKS2ContainerRecoveryKey(c, &testSetLUKS2ContainerRecoveryKeyUnmockedData{
+		options: &KDFOptions{MemoryKiB: 64},
+	})
+}
+
+func (s *cryptSuiteUnmocked) TestSetLUKS2ContainerRecoveryKeyWithCustomKDFIterations(c *C) {
+	s.testSetLUKS2ContainerRecoveryKey(c, &testSetLUKS2ContainerRecoveryKeyUnmockedData{
+		options: &KDFOptions{MemoryKiB: 32, ForceIterations: 8},
+	})
+}
+
+func (s *cryptSuiteUnmockedExpensive) TestListLUKS2ContainerKeyName(c *C) {
 	key := s.newPrimaryKey()
-	recoveryKey := s.newRecoveryKey()
 	path := luks2test.CreateEmptyDiskImage(c, 20)
 
-	c.Check(InitializeLUKS2Container(path, "", key, nil), IsNil)
-	c.Check(AddRecoveryKeyToLUKS2Container(path, key, recoveryKey, nil), IsNil)
+	c.Check(InitializeLUKS2Container(path, "data", key, nil), IsNil)
+	c.Check(SetLUKS2ContainerUnlockKey(path, "bar", key, key, nil), IsNil)
 
-	newKey := s.newPrimaryKey()
-	c.Check(ChangeLUKS2KeyUsingRecoveryKey(path, recoveryKey, newKey), IsNil)
+	var recoveryKey RecoveryKey
+	rand.Read(recoveryKey[:])
+	c.Check(SetLUKS2ContainerRecoveryKey(path, "", key, recoveryKey, nil), IsNil)
 
-	luks2test.CheckLUKS2Passphrase(c, path, recoveryKey[:])
-	// XXX: There's no checking of the configured KDF values here. The function
-	//  being tested here is going away in another PR anyway.
+	names, err := ListLUKS2ContainerUnlockKeyNames(path)
+	c.Check(err, IsNil)
+	c.Check(names, DeepEquals, []string{"bar", "default"})
+
+	names, err = ListLUKS2ContainerRecoveryKeyNames(path)
+	c.Check(err, IsNil)
+	c.Check(names, DeepEquals, []string{"default-recovery"})
 }
