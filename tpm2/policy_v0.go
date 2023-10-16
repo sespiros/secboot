@@ -252,13 +252,7 @@ type pcrPolicyData_v0 struct {
 	AuthorizedPolicySignature *tpm2.Signature
 }
 
-func (d *pcrPolicyData_v0) new(params *pcrPolicyParams) *pcrPolicyData_v0 {
-	return &pcrPolicyData_v0{
-		Selection:      params.pcrs,
-		PolicySequence: d.PolicySequence + 1}
-}
-
-func (d *pcrPolicyData_v0) addPcrAssertions(alg tpm2.HashAlgorithmId, trial *util.TrialAuthPolicy, digests tpm2.DigestList) error {
+func (d *pcrPolicyData_v0) addPcrAssertions(alg tpm2.HashAlgorithmId, trial *util.TrialAuthPolicy, pcrs tpm2.PCRSelectionList, digests tpm2.DigestList) error {
 	// Compute the policy digest that would result from a TPM2_PolicyPCR assertion for each condition
 	var orDigests tpm2.DigestList
 	for _, digest := range digests {
@@ -272,6 +266,7 @@ func (d *pcrPolicyData_v0) addPcrAssertions(alg tpm2.HashAlgorithmId, trial *uti
 	if err != nil {
 		return xerrors.Errorf("cannot create tree for PolicyOR digests: %w", err)
 	}
+	d.Selection = pcrs
 	d.OrData = newPolicyOrDataV0(orTree)
 	return nil
 }
@@ -369,10 +364,10 @@ func (p *keyDataPolicy_v0) PCRPolicySequence() uint64 {
 // validated during execution before executing the corresponding PolicyAuthorize assertion as part of the
 // static policy.
 func (p *keyDataPolicy_v0) UpdatePCRPolicy(alg tpm2.HashAlgorithmId, params *pcrPolicyParams) error {
-	pcrData := p.PCRData.new(params)
+	pcrData := new(pcrPolicyData_v0)
 
 	trial := util.ComputeAuthPolicy(alg)
-	if err := pcrData.addPcrAssertions(alg, trial, params.pcrDigests); err != nil {
+	if err := pcrData.addPcrAssertions(alg, trial, params.pcrs, params.pcrDigests); err != nil {
 		return xerrors.Errorf("cannot compute base PCR policy: %w", err)
 	}
 
