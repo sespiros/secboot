@@ -25,7 +25,6 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/asn1"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -816,15 +815,4 @@ func MakeDiskUnlockKey(rand io.Reader, alg crypto.Hash, primaryKey PrimaryKey) (
 	}
 
 	return pk.unlockKey(alg), cleartextPayload, nil
-}
-
-// MarshalKeys serializes the supplied disk unlock key and auxiliary key in
-// to a format that is ready to be encrypted by a platform's secure device.
-func MarshalKeys(key DiskUnlockKey, auxKey PrimaryKey) []byte {
-	w := new(bytes.Buffer)
-	binary.Write(w, binary.BigEndian, uint16(len(key)))
-	w.Write(key)
-	binary.Write(w, binary.BigEndian, uint16(len(auxKey)))
-	w.Write(auxKey)
-	return w.Bytes()
 }
